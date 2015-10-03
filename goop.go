@@ -29,15 +29,13 @@ func parseGoo(dir, base string) {
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
-	linesCopy := make([]string, 0)
-	linesCopy = append(linesCopy, lines[:]...)
 
 	// set up our regexps
 	//  rClassStart = class declaration
 	rClassStart := regexp.MustCompile("^\\s*class\\s+(" + VALID_NAME + ")\\s*\\{\\s*$")
 	//  rVariableDecl = variable declaration
-	rVariableDecl := regexp.MustCompile("^\\s*var\\s+(.+)$")
-	//  rMethod = method declaration (also captures constructors)
+	rVariableDecl := regexp.MustCompile("^\\s*(" + VALID_NAME + ")\\s+(.+)$")
+	//  rMethodDecl = method declaration (also captures constructors)
 	rMethodDecl := regexp.MustCompile("^\\s*func (" + VALID_NAME + ")\\s*\\((.*)\\)(.*){\\s*$")
 	//  rNewObjectDecl = creation of a new object
 	rNewObjectDecl := regexp.MustCompile("(.*\\s+)new\\s+(" + VALID_NAME + ")\\((.*)\\)(.*)")
@@ -49,10 +47,17 @@ func parseGoo(dir, base string) {
 	rSlashStarCommentEnd := regexp.MustCompile("^(.*)\\*/(.*)$")
 	//  rTab = lines that begin with a tab
 	rTab := regexp.MustCompile("^\t(.*)$")
+	//  rGenericInterface = generic interfaces ($ by itself)
+	rGenericInterface := regexp.MustCompile("\\$(,|;|\\s|{|\\)|\\z)")
+	//  rInterface = non-generic interfaces e.g. $ClassName
+	rInterface := regexp.MustCompile("\\$(" + VALID_NAME + ")")
+	//  rEmpty = line that contains only whitespace
+	rEmpty := regexp.MustCompile("^\\s*$")
 
-	var totalBrackets, classLineStart, classLineEnd int
+	var totalBrackets, classLineStart int
 	var className, constructorArgs string
 	classDecl := make([]string, 0)
+	methodDecl := make([]string, 0)
 
 	// strip our comments...problematic when // or /* are within quotes :(
 	startSlashStarComment := 0
@@ -90,10 +95,10 @@ func parseGoo(dir, base string) {
 			classLineStart = i
 			className = sm[1]
 			lines[i] = ""
-		}
-		if className != "" {
-			if sm := rVariableDecl.FindStringSubmatch(lines[i]); sm != nil {
-				classDecl = append(classDecl, "\t" + sm[1])
+		} else if className != "" {
+			if totalBrackets == 1 && countBrackets == 0 && !rEmpty.MatchString(lines[i]) {
+				// must be a variable declaration if it's not starting/within a block
+				classDecl = append(classDecl, lines[i])
 				lines = append(lines[0:i], lines[i+1:]...)
 				i--
 			} else if sm := rMethodDecl.FindStringSubmatch(lines[i]); sm != nil {
@@ -101,39 +106,105 @@ func parseGoo(dir, base string) {
 				if sm[1] == className {
 					constructorArgs = sm[2]
 				}
+				// save our prototype for putting in our interface
+				methodDecl = append(methodDecl, lines[i])
 				// rewrite our line as method on struct with (this *ClassName)
 				lines[i] = "func (this *" + className + ") " + sm[1] + "(" + sm[2] + ")" + sm[3] + "{"
 			} else if (totalBrackets == 0) {
 				lines = append(lines[0:i], lines[i+1:]...)
-				// now we insert our class struct & NewXyz method...
-				stub := make([]string, 0)
-				stub = append(stub, "type " + className + " struct {");
-				stub = append(stub, classDecl[:]...)
-				stub = append(stub, "}", "")
-				stub = append(stub, "func New" + className + "(" + constructorArgs + ") *" + className + "{")
-				stub = append(stub, "\tthis := " + className + "{}")
+				// construct our class struct
+				classStruct := make([]string, 0)
+				classStruct = append(classStruct, "type " + className + " struct {")
+				classStruct = append(classStruct, classDecl[:]...)
+				classStruct = append(classStruct, "}", "")
+				// build our New__Class function
+				newClass := make([]string, 0)
+				newClass = append(newClass, "func New__" + className + "(" + constructorArgs + ") *" + className + " {")
+				newClass = append(newClass, "\tthis := &" + className + "{}")
 				rStripTypes := regexp.MustCompile("(" + VALID_NAME + ")\\s+" + VALID_NAME + "\\s*(,|\\z)")
-				stub = append(stub, "\tthis." + className + "(" + rStripTypes.ReplaceAllString(constructorArgs, "$1") + ")")
-				stub = append(stub, "\treturn &this")
-				stub = append(stub, "}")
-				// append our stub and reset i
+				newClass = append(newClass, "\tthis." + className + "(" + rStripTypes.ReplaceAllString(constructorArgs, "$1") + ")")
+				newClass = append(newClass, "\treturn this")
+				newClass = append(newClass, "}", "")
+				// build our getters/setters
+				getSet := make([]string, 0)
+				for _, decl := range classDecl {
+					if sm := rVariableDecl.FindStringSubmatch(decl); sm != nil {
+						// don't provide getters/setters for private declarations
+						if sm[1][0] < 'A' || sm[1][0] > 'Z' {
+							continue
+						}
+						// getter has same method name as Variable
+						// if that function exists within our methods then don't provide it
+						funcFound := false
+						for _, method := range methodDecl {
+							sm2 := rMethodDecl.FindStringSubmatch(method)
+							if sm2 != nil && sm2[1] == sm[1] {
+								funcFound = true
+								break
+							}
+						}
+						if !funcFound {
+							// add our method to the code stub
+							getSet = append(getSet, "func (this *" + className + ") " + sm[1] + "() " + sm[2] + " {")
+							getSet = append(getSet, "\treturn this." + sm[1], "}", "")
+							// add our method to the method declarations
+							methodDecl = append(methodDecl, "\tfunc " + sm[1] + "() " + sm[2] + " {")
+						}
+						// if setter exists within our methods, then don't provide it
+						setterName := "Set" + sm[1]
+						funcFound = false
+						for _, method := range methodDecl {
+							sm2 := rMethodDecl.FindStringSubmatch(method)
+							if sm2 != nil && sm2[1] == setterName {
+								funcFound = true
+								break
+							}
+						}
+						if !funcFound {
+							// add our method to the code stub
+							getSet = append(getSet, "func (this *" + className + ") " + setterName + "(" + sm[1] + " " + sm[2] + ") {")
+							getSet = append(getSet, "\tthis." + sm[1] + " = " + sm[1], "}", "")
+							// add our method to the method declarations
+							methodDecl = append(methodDecl, "\tfunc " + setterName + "(" + sm[1] + " " + sm[2] + ") {")
+						}
+					}
+				}
+				// construct our class interface
+				classInterface := make([]string, 0)
+				classInterface = append(classInterface, "type Interface__" + className + " interface {")
+				for _, decl := range methodDecl {
+					classInterface = append(classInterface, decl[0:strings.LastIndex(decl, "{")])
+				}
+				classInterface = append(classInterface, "}", "")
+				// append our class code and reset i
 				newLines := make([]string, 0)
-				newLines = append(newLines, lines[classLineEnd:classLineStart]...)
-				newLines = append(newLines, stub[:]...)
+				newLines = append(newLines, lines[0:classLineStart]...)
+				newLines = append(newLines, classStruct...)
+				newLines = append(newLines, classInterface...)
+				newLines = append(newLines, newClass...)
+				newLines = append(newLines, getSet...)
+				// strip trailing blank line
+				newLines = newLines[:len(newLines)-1]
 				newLines = append(newLines, lines[classLineStart + 1:]...)
 				lines = newLines
-				i += len(stub) - 1
+				i += len(classStruct) + len(classInterface) + len(newClass) + len(getSet) - 2
 				// reset our context
-				classLineEnd = i
+				classDecl = make([]string, 0)
+				methodDecl = make([]string, 0)
 				className = ""
 			} else {
 				lines[i] = rTab.ReplaceAllString(lines[i], "$1")
 			}
 		}
+		// for each instance of "new Xyz(args)" convert to "NewXyz(args)"
 		for rNewObjectDecl.MatchString(lines[i]) {
 			sm := rNewObjectDecl.FindStringSubmatch(lines[i])
-			lines[i] = sm[1] + "New" + sm[2] + "(" + sm[3] + ")" + sm[4]
+			lines[i] = sm[1] + "New__" + sm[2] + "(" + sm[3] + ")" + sm[4]
 		}
+		// convert "$" to "interface{}"
+		lines[i] = rGenericInterface.ReplaceAllString(lines[i], "interface{}$1")
+		// convert "$ClassName" to Interface__ClassName
+		lines[i] = rInterface.ReplaceAllString(lines[i], "Interface__$1")
 	}
 
 	gofile := strings.Join(lines[1:], "\n")
